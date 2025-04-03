@@ -6,11 +6,19 @@ Test script for poker agent to debug the hand evaluation issue.
 import os
 import traceback
 from dotenv import load_dotenv
+import base64
 
 from src.agent.agent import build_graph, run_agent
 
 # Load API key
 load_dotenv()
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+    return encoded_string
+
+base64_image = encode_image("src/tests/image.jpg")
 
 
 def main():
@@ -28,16 +36,16 @@ def main():
         
         # Optional: Test with a multimodal message (mock image)
         # Uncomment to test with a dummy base64 image
-        """
+        
         print("\nTesting with multimodal message (image + text)...")
         # This is a tiny 1x1 transparent pixel
-        dummy_image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        dummy_image_b64 = base64_image
         result_messages = run_agent(
             poker_graph,
             "What do you see in this image?",
             image_base64=dummy_image_b64
         )
-        """
+        
         
         print("\n--- Final Conversation History ---")
         for msg in result_messages:

@@ -69,65 +69,118 @@ def create_llm_client(provider: str = DEFAULT_PROVIDER):
     return llm
 
 
-def should_continue(state: AgentState) -> str:
+def route_from_image(state: AgentState) -> Literal["plan", "end"]:
     """
-    Determines whether to call tools, respond directly, or end.
+    Routes from image processing node.
+    Determines whether to continue to planning or skip directly to executing a response.
     
     Args:
         state: The current agent state
         
     Returns:
-        Routing decision: "plan", "execute", "tool", "format" or "end"
+        Routing decision: "plan" or "end"
     """
-    messages = state['messages']
+    messages = state["messages"]
+    
+    # Check if the last 1-2 messages indicate non-poker content
+    for msg in messages[-2:]:
+        if isinstance(msg, AIMessage) and hasattr(msg, 'content'):
+            content = msg.content
+            if isinstance(content, str) and "does not contain poker-related content" in content.lower():
+                # We detected a non-poker image but will still continue to planning
+                # since the user might have a text query we can help with
+                print("[AGENT] Non-poker image detected, but continuing to planning for text query")
+                return "plan"
+    
+    print("[AGENT] Image processing complete. Moving to planning stage.")
+    return "plan"
+
+def route_from_plan(state: AgentState) -> Literal["execute", "end"]:
+    """
+    Routes from planning node.
+    Handles cases where no tools are needed for non-poker content.
+    
+    Args:
+        state: The current agent state
+        
+    Returns:
+        Routing decision: "execute" or "end"
+    """
+    messages = state["messages"]
+    
+    # Check if the planning stage decided no tools are needed
+    for msg in messages[-2:]:
+        if isinstance(msg, AIMessage) and hasattr(msg, 'content'):
+            content = msg.content
+            if isinstance(content, str):
+                # Check for "no poker tools needed" message or direct response for non-poker content
+                if "no poker tools needed" in content.lower() or "doesn't contain poker content" in content.lower():
+                    print("[AGENT] Planning decided no tools needed for non-poker content. Ending workflow.")
+                    return "end"
+    
+    print("[AGENT] Planning complete. Moving to execution stage.")
+    return "execute"
+
+def route_from_execute(state: AgentState) -> Literal["tool", "plan", "format", "end"]:
+    """
+    Routes from execution node.
+    
+    Args:
+        state: The current agent state
+        
+    Returns:
+        Routing decision: "tool", "plan", "format", or "end"
+    """
+    messages = state["messages"]
     last_message = messages[-1]
     
-    # Check current stage from state
-    stage = state.get("stage", "plan")
-    
-    # Log the transition decision
-    print(f"[AGENT] Current stage: {stage}, deciding next transition...")
-    
-    # Stage-based routing
-    if stage == "plan":
-        print(f"[AGENT] Planning complete. Moving to execution stage.")
-        # Move to the tool executor (execute)
-        return "execute"
-    elif stage == "execute":
-        # If the LLM made tool calls, route to the tool node
-        tool_calls = getattr(last_message, "tool_calls", None)
-        if tool_calls:
-            print(f"[AGENT] Tool calls detected: {tool_calls}. Moving to tool stage.")
-            return "tool"
-        # If we're enforcing tool use but no tools were called, go back to planning
-        elif ENFORCE_TOOL_USE:
-            print(f"[AGENT] No tool calls but tools required. Moving back to planning stage.")
-            return "plan"
-        # Otherwise, move to formatting the response
-        else:
-            print(f"[AGENT] No tool calls and tools not required. Moving to formatting stage.")
-            return "format"
-    elif stage == "tool":
-        # After tool execution, always move to format response
-        print(f"[AGENT] Tool execution complete. Moving to formatting stage.")
-        return "format"
-    elif stage == "format":
-        # After formatting, end the interaction
-        print(f"[AGENT] Formatting complete. Ending interaction.")
-        return "end"
-    elif stage == "image":
-        # After image processing, go to the planning stage
-        print(f"[AGENT] Image processing complete. Moving to planning stage.")
+    # If the LLM made tool calls, route to the tool node
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if tool_calls:
+        print(f"[AGENT] Tool calls detected: {tool_calls}. Moving to tool stage.")
+        return "tool"
+    # If we're enforcing tool use but no tools were called, go back to planning
+    elif ENFORCE_TOOL_USE:
+        print(f"[AGENT] No tool calls but tools required. Moving back to planning stage.")
         return "plan"
+    # Otherwise, move to formatting the response
+    else:
+        print(f"[AGENT] No tool calls and tools not required. Moving to formatting stage.")
+        return "format"
+
+
+def route_from_tool(state: AgentState) -> Literal["format", "end"]:
+    """
+    Routes from tool execution node.
     
-    # Default end if unexpected state
-    print(f"[AGENT] WARNING: Unexpected state '{stage}'. Ending interaction.")
+    Args:
+        state: The current agent state
+        
+    Returns:
+        Routing decision: "format" or "end"
+    """
+    print("[AGENT] Tool execution complete. Moving to formatting stage.")
+    return "format"
+
+
+def route_from_format(state: AgentState) -> Literal["end"]:
+    """
+    Routes from formatting node.
+    
+    Args:
+        state: The current agent state
+        
+    Returns:
+        Routing decision: "end"
+    """
+    print("[AGENT] Formatting complete. Ending interaction.")
     return "end"
 
 
 def call_plan_agent(state: AgentState) -> Dict[str, Any]:
     """
     Planning agent to determine which tools to use.
+    Handles cases where images don't contain poker content.
     
     Args:
         state: The current agent state
@@ -139,11 +192,21 @@ def call_plan_agent(state: AgentState) -> Dict[str, Any]:
     messages = state['messages']
     provider = state.get('provider', DEFAULT_PROVIDER)
     
+    # Check if we previously detected a non-poker image
+    non_poker_image = False
+    for msg in messages[-3:]:  # Check last few messages
+        if isinstance(msg, AIMessage) and hasattr(msg, 'content'):
+            content = msg.content
+            if isinstance(content, str) and "does not contain poker-related content" in content.lower():
+                non_poker_image = True
+                print("[AGENT] Planning detected previous non-poker image message")
+                break
+    
     # Create planning agent
     llm = create_llm_client(provider)
     print(f"[AGENT] Created LLM client with provider: {provider}")
     
-    # Custom planning prompt
+    # Custom planning prompt with adjustments for non-poker images
     planning_prompt = """
     You are a Poker Planning Agent. Your job is to analyze the user's query and determine which poker tools should be used.
     Available tools:
@@ -151,12 +214,28 @@ def call_plan_agent(state: AgentState) -> Dict[str, Any]:
     - parse_hand_range: For understanding poker range notation
     - calculate_holdem_equity: For calculating win probabilities between ranges
     
-    You must recommend at least one tool to use. For each tool, specify the exact parameters to pass.
-    Format your response as a simple list with tool names and parameter values, like this example:
+    """
     
-    Tool: evaluate_poker_hand
-    Parameters: hole_cards_string="AcKc", board_string="QcJcTc"
+    # If we detected a non-poker image, adjust the planning instructions
+    if non_poker_image:
+        planning_prompt += """
+        I notice the image provided does not contain poker content. For text-only queries:
+        1. If the user's text query is about poker, recommend at least one appropriate tool.
+        2. If the user's text query is not about poker, you can respond that no tools are needed.
+        
+        Format your response as a simple list with tool names and parameter values, or clearly state 
+        "No poker tools needed" if the query is not poker-related.
+        """
+    else:
+        planning_prompt += """
+        You must recommend at least one tool to use. For each tool, specify the exact parameters to pass.
+        Format your response as a simple list with tool names and parameter values, like this example:
+        
+        Tool: evaluate_poker_hand
+        Parameters: hole_cards_string="AcKc", board_string="QcJcTc"
+        """
     
+    planning_prompt += """
     Do not execute the tools yourself. Just suggest which ones to use.
     """
     
@@ -169,11 +248,26 @@ def call_plan_agent(state: AgentState) -> Dict[str, Any]:
     planning_response = llm.invoke(planning_messages)
     print(f"[AGENT] Planning complete. Response type: {type(planning_response)}")
     
-    # Update state to move to execution
-    print("[AGENT] Moving to execution stage")
+    # If non-poker image was detected, check if planning says no tools needed
+    if non_poker_image and hasattr(planning_response, 'content'):
+        content = planning_response.content
+        if isinstance(content, str) and "no poker tools needed" in content.lower():
+            # Add a direct response to the user without using tools
+            direct_response = AIMessage(content="""
+            I notice the image you've provided doesn't contain poker content, and your query doesn't seem to be about poker strategy or hand analysis. 
+            
+            I'm specialized in poker coaching and analysis. If you have any poker-related questions or want to analyze hands, positions, or strategies, please let me know! 
+            
+            You can also upload screenshots of poker games, hand histories, or poker situations for detailed analysis.
+            """)
+            return {
+                "messages": messages + [planning_response, direct_response],
+                "provider": provider
+            }
+    
+    # Return updated state with the model's response
     return {
         "messages": messages + [planning_response],
-        "stage": "execute",
         "provider": provider
     }
 
@@ -181,6 +275,7 @@ def call_plan_agent(state: AgentState) -> Dict[str, Any]:
 def process_image(state: AgentState) -> Dict[str, Any]:
     """
     Image processing agent that extracts poker-related information from images.
+    Handles cases where images don't contain poker content.
     
     Args:
         state: The current agent state
@@ -197,7 +292,7 @@ def process_image(state: AgentState) -> Dict[str, Any]:
     for msg in messages:
         if hasattr(msg, 'content') and isinstance(msg.content, list):
             for content_part in msg.content:
-                if content_part.get("type") == "image_url":
+                if isinstance(content_part, dict) and content_part.get("type") == "image_url":
                     image_content = content_part
                     print("[AGENT] Found image content in message")
                     break
@@ -207,43 +302,80 @@ def process_image(state: AgentState) -> Dict[str, Any]:
         print("[AGENT] No image found. Skipping image processing, moving to planning stage.")
         return {
             "messages": messages,
-            "stage": "plan",
             "provider": provider
         }
+    
+    # For debugging, print image details
+    if image_content and "image_url" in image_content:
+        url_data = image_content["image_url"]
+        print(f"[AGENT] Image URL details: {url_data.get('detail')}")
+        # Only print first 50 chars of URL to avoid flooding logs
+        url_str = url_data.get('url', '')
+        print(f"[AGENT] Image URL prefix: {url_str[:50]}...")
     
     # Create image processing agent
     print(f"[AGENT] Creating LLM client for image processing with provider: {provider}")
     llm = create_llm_client(provider)
     
-    # Custom image analysis prompt
+    # Custom image analysis prompt with instructions for non-poker images
     image_prompt = """
-    You are a Poker Image Analysis Agent. Your job is to look at the poker game image and extract all relevant details as text.
-    Describe in detail:
-    1. What cards are visible (player hands, community cards)
-    2. Chip stacks and bet sizes visible
-    3. Number of players
-    4. Game type (cash game, tournament)
-    5. Any relevant context visible in the image
+    You are a Poker Image Analysis Agent. Your job is to look at the image and extract all relevant poker details.
     
-    Format your response as a clear, detailed description that can be used by other agents.
+    First, determine if the image contains a poker game or poker-related content.
+    
+    If the image DOES contain poker content:
+        Describe in detail:
+        1. What cards are visible (player hands, community cards)
+        2. Chip stacks and bet sizes visible
+        3. Number of players
+        4. Game type (cash game, tournament)
+        5. Any relevant context visible in the image
+    
+    If the image DOES NOT contain poker content:
+        1. State clearly that "The image does not contain poker-related content."
+        2. Provide a brief description of what is actually in the image
+        3. DO NOT make up or hallucinate poker details that aren't present
+    
+    Format your response as a clear, detailed description.
     """
     
     # Add image analysis prompt to conversation
     image_analysis_messages = messages + [SystemMessage(content=image_prompt)]
     print(f"[AGENT] Added image analysis prompt to messages. Total messages: {len(image_analysis_messages)}")
     
-    # Get image analysis
-    print("[AGENT] Invoking image analysis LLM...")
-    image_analysis = llm.invoke(image_analysis_messages)
-    print(f"[AGENT] Image analysis complete. Response type: {type(image_analysis)}")
-    
-    # Update state to move to planning
-    print("[AGENT] Image processing complete. Moving to planning stage.")
-    return {
-        "messages": messages + [image_analysis],
-        "stage": "plan",
-        "provider": provider
-    }
+    try:
+        # Get image analysis
+        print("[AGENT] Invoking image analysis LLM...")
+        image_analysis = llm.invoke(image_analysis_messages)
+        print(f"[AGENT] Image analysis complete. Response type: {type(image_analysis)}")
+        
+        # Check if the response indicates no poker content
+        response_content = image_analysis.content if hasattr(image_analysis, 'content') else ""
+        if isinstance(response_content, str) and "does not contain poker-related content" in response_content.lower():
+            print("[AGENT] Image analysis detected non-poker content")
+            
+            # Add a follow-up message asking for poker-related images
+            non_poker_message = AIMessage(content="I notice the image you've shared doesn't contain poker-related content. For the best poker analysis, please upload an image showing a poker game, hand, or poker-related scenario. In the meantime, I'll try to help with your text query.")
+            
+            # Update the messages with both the analysis and follow-up
+            return {
+                "messages": messages + [image_analysis, non_poker_message],
+                "provider": provider
+            }
+        
+        # If poker content detected, proceed normally
+        return {
+            "messages": messages + [image_analysis],
+            "provider": provider
+        }
+    except Exception as e:
+        # Handle image processing errors
+        print(f"[AGENT] Error during image processing: {e}")
+        error_message = AIMessage(content=f"I had trouble processing the image: {str(e)}")
+        return {
+            "messages": messages + [error_message],
+            "provider": provider
+        }
 
 
 def call_model(state: AgentState) -> Dict[str, Any]:
@@ -280,25 +412,9 @@ def call_model(state: AgentState) -> Dict[str, Any]:
     response = llm_with_tools.invoke(messages)
     print(f"[AGENT] Tool execution complete. Response type: {type(response)}")
     
-    # Check if tools were actually called
-    tool_calls = getattr(response, "tool_calls", None)
-    if tool_calls:
-        print(f"[AGENT] Tool calls detected in response: {tool_calls}")
-        next_stage = "tool"
-    else:
-        print("[AGENT] No tool calls detected in response.")
-        if ENFORCE_TOOL_USE:
-            print("[AGENT] Tools required but none called. Will route back to planning.")
-            next_stage = "plan"
-        else:
-            print("[AGENT] No tools required. Will move to formatting.")
-            next_stage = "format"
-    
     # Return updated state with the model's response
-    print(f"[AGENT] Moving to {next_stage} stage")
     return {
         "messages": messages + [response],
-        "stage": next_stage, 
         "provider": provider
     }
 
@@ -335,7 +451,6 @@ def format_response(state: AgentState) -> Dict[str, Any]:
         # Just return the current state with the last message
         return {
             "messages": messages,
-            "stage": "end",
             "provider": provider
         }
     
@@ -368,7 +483,6 @@ def format_response(state: AgentState) -> Dict[str, Any]:
     print("[AGENT] Formatting complete. Moving to end stage.")
     return {
         "messages": messages + [formatted_response],
-        "stage": "end",
         "provider": provider
     }
 
@@ -393,10 +507,10 @@ def build_graph():
     # Set entry point - start with image processing
     workflow.set_entry_point("image")
 
-    # Add conditional edges based on the should_continue routing
+    # Add conditional edges based on routing functions
     workflow.add_conditional_edges(
         "image",
-        should_continue,
+        route_from_image,
         {
             "plan": "plan",
             "end": END
@@ -405,7 +519,7 @@ def build_graph():
     
     workflow.add_conditional_edges(
         "plan",
-        should_continue,
+        route_from_plan,
         {
             "execute": "execute",
             "end": END
@@ -414,7 +528,7 @@ def build_graph():
     
     workflow.add_conditional_edges(
         "execute",
-        should_continue,
+        route_from_execute,
         {
             "tool": "tool",
             "plan": "plan",
@@ -425,7 +539,7 @@ def build_graph():
     
     workflow.add_conditional_edges(
         "tool",
-        should_continue,
+        route_from_tool,
         {
             "format": "format",
             "end": END
@@ -434,14 +548,20 @@ def build_graph():
     
     workflow.add_conditional_edges(
         "format",
-        should_continue,
+        route_from_format,
         {
             "end": END
         }
     )
 
+    # Print workflow structure for debugging (before compilation)
+    print("Graph nodes:", workflow.nodes)
+    
     # Compile the graph
-    return workflow.compile()
+    graph = workflow.compile()
+    
+    # Return the compiled graph
+    return graph
 
 
 def run_agent(graph, user_input: str, image_base64: Optional[str] = None, 
@@ -487,13 +607,17 @@ def run_agent(graph, user_input: str, image_base64: Optional[str] = None,
 
     # Format the user input, with or without image data
     if image_base64:
-        # Create a multimodal message with the image
+        # Validate the image is not empty or too small
+        if len(image_base64) < 100:
+            print(f"[AGENT RUNNER] WARNING: Image data seems very small ({len(image_base64)} bytes)")
+        
+        # Create a multimodal message with the image - use JPEG format
         user_message = HumanMessage(content=[
             {
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:image/jpeg;base64,{image_base64}",
-                    "detail": "high"
+                    "detail": "auto"  # Use 'auto' instead of 'high' for better compatibility
                 }
             },
             {
@@ -516,7 +640,6 @@ def run_agent(graph, user_input: str, image_base64: Optional[str] = None,
     try:
         final_state = graph.invoke({
             "messages": input_messages,
-            "stage": "image",  # Start with image processing
             "provider": provider
         })
         print("[AGENT RUNNER] Agent graph execution completed successfully")
